@@ -6,8 +6,23 @@ from dotenv import load_dotenv
 import sys
 from sentence_transformers import SentenceTransformer, util
 import numpy as np
+import faiss
+from pymilvus import connections, Collection, FieldSchema, DataType
 
 load_dotenv()
+
+# Load SBERT-Model
+model = SentenceTransformer('paraphrase-multilingual-mpnet-base-v2', device='cpu')
+
+users = [
+    {
+        "firstname": "Julian",
+        "lastname": "Bertsch",
+        "preferences": ["Sexual Happiness"],
+        "pre_assets": ["Youtube-Channel", "Blog"],
+        "pre_knowledge": ["Facebook Ads", "Google Ads", "SEO", "SEA"]
+    }
+]
 
 
 def connect_to_mongodb():
@@ -92,8 +107,11 @@ def getPartnerPrograms():
 def transformPartnerProgramsDataset(partnerprograms):
     df = pd.DataFrame(partnerprograms)
     selection_df = [
+        '_id',
         'title',
         'description',
+        'commissionInPercent',
+        'commissionFixed',
         'rating',
         'reviews',
         'resolved_sources',
@@ -122,10 +140,228 @@ def transformPartnerProgramsDataset(partnerprograms):
         lambda x: [item.get('title') for item in x] if x else [])
     return subset_df
 
-def index():
+def retrieve_embeddings_from_milvus(collection_name='products', batch_size=1000):
+    # Verbinde mit Milvus
+    connections.connect(
+        alias="default",
+        host='localhost',
+        port='19530'
+    )
+
+    # Stelle eine Verbindung zur Collection her
+    collection = Collection(name=collection_name)
+
+    # Abruf der IDs in Batches
+    all_ids = []
+    offset = 0
+    ids = collection.list_id_array(limit=offset + batch_size)
+    while ids:
+        all_ids.extend(ids)
+        offset += batch_size
+        ids = collection.list_id_array(limit=offset + batch_size)
+
+    # Abruf der Embeddings basierend auf den IDs
+    all_embeddings = []
+    for batch_ids in all_ids:
+        embeddings = collection.get_entity_by_id(batch_ids)
+        all_embeddings.extend(embeddings)
+
+    # Trenne die Verbindung zu Milvus
+    connections.disconnect("default")
+
+    return np.array(all_embeddings, dtype=np.float32)
+
+
+def create_and_save_product_embeddings_to_milvus(data, collection_name='products', batch_size=1000):
+    # Verbinde mit Milvus
+    connections.connect(
+        alias="default",
+        host='localhost',
+        port='19530'
+    )
+
+    milvus_instance = connections.get_connection()
+
+    # Überprüfe, ob die Collection bereits existiert, erstelle sie andernfalls
+    if collection_name in milvus_instance.list_collections():
+        collection = Collection(name=collection_name)
+    else:
+        # Annahme: Dimensionalität deiner Embeddings
+        dimension = model.encode("test").shape[0]
+
+        # Erstelle eine Collection
+        collection = Collection(name=collection_name, schema=[FieldSchema(name='embedding', dtype=DataType.FLOAT_VECTOR, dim=dimension)])
+        collection.create()
+
+    # Erzeuge Embeddings und speichere sie in Batches in die Collection
+    embeddings = []
+    weights = []
+    weight = 1.0
+
+    for i, entry in enumerate(data):
+        weight_interests = 2.0
+        weight_description = 1.0
+
+        combined_data = ("Name:" + entry['title']
+                         + ", Description: " + entry['description']
+                         + ", categories: " + ",".join(entry['categories']))
+
+        combined_data += ", Instant Accept: "
+        if entry['directActivation']:
+            weight += 0.2
+            combined_data += "yes"
+        else:
+            combined_data += "no"
+
+        weight += (0.01 * len(entry["advertisementAssets"]))
+        # if entry["trackingLifetime"]:
+        #     weight += (0.01 * entry["trackingLifetime"])
+        # if entry["commissionInPercent"]:
+        #     weight += (0.1 * entry["commissionInPercent"])
+        # else:
+        #     weight += (0.2 * entry["commissionFixed"])
+
+        weight += weight_interests + weight_description
+
+        # print(entry['title'] + " " + str(weight))
+
+        embedding = model.encode(combined_data)
+        embeddings.append(embedding)
+        weights.append(weight)
+        print(i)
+
+        if i % batch_size == 0 and i > 0:
+            embeddings_np = np.array(embeddings, dtype=np.float32)
+            weights_np = np.array(weights, dtype=np.float32)
+
+            # Concatenate embeddings with weights
+            embeddings_weighted = embeddings_np * weights_np[:, np.newaxis]
+
+            # Schreibe die aktuellen Embeddings in die Milvus-Collection
+            collection.insert(data={'embedding': embeddings_weighted})
+            collection.flush()
+
+            # Leere die Listen für die nächste Batch-Iteration
+            embeddings = []
+            weights = []
+
+    # Überprüfe, ob es noch verbleibende Embeddings gibt
+    if embeddings:
+        embeddings_np = np.array(embeddings, dtype=np.float32)
+        weights_np = np.array(weights, dtype=np.float32)
+
+        # Concatenate embeddings with weights
+        embeddings_weighted = embeddings_np * weights_np[:, np.newaxis]
+
+        # Schreibe die restlichen Embeddings in die Milvus-Collection
+        collection.insert(data={'embedding': embeddings_weighted})
+        collection.flush()
+
+    # Trenne die Verbindung zu Milvus
+    connections.disconnect("default")
+
+    return embeddings
+
+def create_product_embeddings(data, index_filename='embedding_index.index'):
+    embeddings = []
+    weights = []
+    weight = 1.0
+    for i, entry in data:
+        weight_interests = 2.0
+        weight_description = 1.0
+
+        combined_data = ("Name:" + entry['title']
+                         + ", Description: " + entry['description']
+                         + ", categories: " + ",".join(entry['categories']))
+
+        combined_data += ", Instant Accept: "
+        if entry['directActivation']:
+            weight += 0.2
+            combined_data += "yes"
+        else:
+            combined_data += "no"
+
+        weight += (0.01 * len(entry["advertisementAssets"]))
+        # if entry["trackingLifetime"]:
+        #     weight += (0.01 * entry["trackingLifetime"])
+        # if entry["commissionInPercent"]:
+        #     weight += (0.1 * entry["commissionInPercent"])
+        # else:
+        #     weight += (0.2 * entry["commissionFixed"])
+
+        weight += weight_interests + weight_description
+
+        # print(entry['title'] + " " + str(weight))
+
+        embedding = model.encode(combined_data)
+        embeddings.append(embedding)
+        weights.append(weight)
+        print(i)
+
+    # Initialize the Faiss index
+    embeddings_np = np.array(embeddings, dtype=np.float32)
+    weights_np = np.array(weights, dtype=np.float32)
+
+    # Concatenate embeddings with weights
+    embeddings_weighted = embeddings_np * weights_np[:, np.newaxis]
+
+    index = faiss.IndexFlatL2(embeddings_weighted.shape[1])
+
+    # Add embeddings to the index
+    index.add(embeddings_weighted)
+
+        # Save the index to a file
+    faiss.write_index(index, index_filename)
+    return embeddings
+
+def create_embeddings_user(data):
+    embeddings = []
+    for entry in data:
+        combined_data = "Interessen: " + ",".join(entry['preferences']) + ", Vorwissen: " + ",".join(entry['pre_knowledge'])
+        embedding = model.encode(combined_data)
+        embeddings.append(embedding)
+    return embeddings
+
+def index(index_filename='embedding_index.index'):
+    partnerprograms = getPartnerPrograms()
+    df = transformPartnerProgramsDataset(partnerprograms)
+    user_embeddings = create_embeddings_user(users)
+
+    # Load the Faiss index
+    faiss_index = faiss.read_index(index_filename)
+
+    full_embedding = np.zeros((faiss_index.ntotal, faiss_index.d), dtype=np.float32)
+
+
+    print(faiss_index.ntotal)
+
+    # Fülle den Vektor mit den rekonstruierten Embeddings
+    for i in range(faiss_index.ntotal):
+        full_embedding[i] = faiss_index.reconstruct(i)
+
+    similarities_matrix = util.pytorch_cos_sim(np.array(user_embeddings), np.array(full_embedding))
+
+
+    #Iterate through users and products to print similarity scores
+    for user_idx, user in enumerate(users):
+        user_similarity_scores = similarities_matrix[user_idx].numpy()
+        top_n_indices = np.argsort(user_similarity_scores)[::-1][:5]
+        # Display the recommendations
+        print(f"Top 5 Recommendations for User '{user['firstname']} {user['lastname']}':")
+        for product_idx in top_n_indices:
+            product = df.iloc[product_idx]
+            print(
+                f"  - {product['title']} '{','.join(product['categories'])}' with similarity score: {user_similarity_scores[product_idx]:.4f}")
+
+def store_embeddings():
     partnerprograms = getPartnerPrograms()
     df = transformPartnerProgramsDataset(partnerprograms)
 
-    # TODO: use dataset to get recommendations
+    product_embeddings = create_product_embeddings(df.iterrows())
+def store_embeddings_milvus():
+    partnerprograms = getPartnerPrograms()
+    df = transformPartnerProgramsDataset(partnerprograms)
 
-index()
+    product_embeddings = create_and_save_product_embeddings_to_milvus(df.head(100).iterrows())
+
+store_embeddings_milvus()

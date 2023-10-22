@@ -1,5 +1,8 @@
+import random
+
 import pymongo
 import pandas as pd
+from pymilvus.orm import utility
 from pymongo.mongo_client import MongoClient
 import os
 from dotenv import load_dotenv
@@ -7,7 +10,7 @@ import sys
 from sentence_transformers import SentenceTransformer, util
 import numpy as np
 import faiss
-from pymilvus import connections, Collection, FieldSchema, DataType
+from pymilvus import connections, Collection, FieldSchema, DataType, Milvus, CollectionSchema
 
 load_dotenv()
 
@@ -97,8 +100,7 @@ def getPartnerPrograms():
                     "foreignField": "_id",
                     "as": "resolved_advertisementAssets"
                 }
-            },
-            # Füge weitere $lookup-Stufen für andere referenzierte Felder hinzu
+            }
         ]
         cursor = collection_partnerprograms.aggregate(pipeline)
         partnerprograms = list(cursor)
@@ -141,17 +143,14 @@ def transformPartnerProgramsDataset(partnerprograms):
     return subset_df
 
 def retrieve_embeddings_from_milvus(collection_name='products', batch_size=1000):
-    # Verbinde mit Milvus
     connections.connect(
         alias="default",
         host='localhost',
         port='19530'
     )
 
-    # Stelle eine Verbindung zur Collection her
     collection = Collection(name=collection_name)
 
-    # Abruf der IDs in Batches
     all_ids = []
     offset = 0
     ids = collection.list_id_array(limit=offset + batch_size)
@@ -160,45 +159,83 @@ def retrieve_embeddings_from_milvus(collection_name='products', batch_size=1000)
         offset += batch_size
         ids = collection.list_id_array(limit=offset + batch_size)
 
-    # Abruf der Embeddings basierend auf den IDs
     all_embeddings = []
     for batch_ids in all_ids:
         embeddings = collection.get_entity_by_id(batch_ids)
         all_embeddings.extend(embeddings)
 
-    # Trenne die Verbindung zu Milvus
     connections.disconnect("default")
 
     return np.array(all_embeddings, dtype=np.float32)
 
+def handleEmbeddings(collection, embeddings, weights):
+    embeddings_weighted = np.array(embeddings, dtype=np.float32)
+    weights_np = np.array(weights, dtype=np.float32)
+
+    # Debug prints
+    print(f"Length of embeddings list: {len(embeddings)}")
+    print(f"Shape of embeddings_weighted before weighting: {embeddings_weighted.shape}")
+
+    # Ensure that the dimensions match for weighting
+    assert embeddings_weighted.shape[0] == len(
+        embeddings), f"Unexpected batch size for remaining embeddings: {embeddings_weighted.shape[0]}"
+
+    # Ensure that the weights have the correct shape
+    assert weights_np.shape[0] == len(embeddings), f"Unexpected length for weights: {weights_np.shape[0]}"
+
+    # Apply weights to each embedding vector
+    embeddings_weighted *= weights_np[:, np.newaxis]
+
+    # Debug prints
+    print(f"Shape of embeddings_weighted after weighting: {embeddings_weighted.shape}")
+
+    # Explicitly convert the entire batch to float32
+    # embeddings_weighted = embeddings_weighted.astype(np.float32)
+
+    schema = collection.describe()
+    print(schema)
+
+    expected_dtype = DataType.FLOAT_VECTOR
+    print(f"Expected DataType: {expected_dtype}")
+
+    expected_dtype = DataType.FLOAT_VECTOR
+    if embeddings_weighted.dtype != np.float32:
+        embeddings_weighted = embeddings_weighted.astype(np.float32)
+    embeddings_weighted = embeddings_weighted.tolist()
+
+    try:
+        data = [
+            embeddings_weighted,
+        ]
+
+        collection.insert(data)
+        collection.flush()
+    except Exception as e:
+        print(f"Error during insert operation: {e}")
+
 
 def create_and_save_product_embeddings_to_milvus(data, collection_name='products', batch_size=1000):
-    # Verbinde mit Milvus
     connections.connect(
         alias="default",
         host='localhost',
         port='19530'
     )
 
-    milvus_instance = connections.get_connection()
-
-    # Überprüfe, ob die Collection bereits existiert, erstelle sie andernfalls
-    if collection_name in milvus_instance.list_collections():
+    if collection_name in utility.list_collections():
         collection = Collection(name=collection_name)
     else:
-        # Annahme: Dimensionalität deiner Embeddings
         dimension = model.encode("test").shape[0]
+        field1 = FieldSchema(name='id', dtype=DataType.INT64, description="int64", is_primary=True, auto_id=True)
+        field2 = FieldSchema(name='embedding', dtype=DataType.FLOAT_VECTOR, description="float vector", dim=dimension,
+                             is_primary=False)
+        schema = CollectionSchema(fields=[field1, field2], description="collection description")
+        collection = Collection(name=collection_name, data=None, schema=schema, properties={"collection.ttl.seconds": 15})
 
-        # Erstelle eine Collection
-        collection = Collection(name=collection_name, schema=[FieldSchema(name='embedding', dtype=DataType.FLOAT_VECTOR, dim=dimension)])
-        collection.create()
-
-    # Erzeuge Embeddings und speichere sie in Batches in die Collection
     embeddings = []
     weights = []
     weight = 1.0
 
-    for i, entry in enumerate(data):
+    for i, entry in data:
         weight_interests = 2.0
         weight_description = 1.0
 
@@ -225,39 +262,21 @@ def create_and_save_product_embeddings_to_milvus(data, collection_name='products
 
         # print(entry['title'] + " " + str(weight))
 
+        print(i)
+
+        record_id = i
         embedding = model.encode(combined_data)
         embeddings.append(embedding)
         weights.append(weight)
-        print(i)
 
         if i % batch_size == 0 and i > 0:
-            embeddings_np = np.array(embeddings, dtype=np.float32)
-            weights_np = np.array(weights, dtype=np.float32)
-
-            # Concatenate embeddings with weights
-            embeddings_weighted = embeddings_np * weights_np[:, np.newaxis]
-
-            # Schreibe die aktuellen Embeddings in die Milvus-Collection
-            collection.insert(data={'embedding': embeddings_weighted})
-            collection.flush()
-
-            # Leere die Listen für die nächste Batch-Iteration
+            handleEmbeddings(collection, embeddings, weights)
             embeddings = []
             weights = []
 
-    # Überprüfe, ob es noch verbleibende Embeddings gibt
     if embeddings:
-        embeddings_np = np.array(embeddings, dtype=np.float32)
-        weights_np = np.array(weights, dtype=np.float32)
+        handleEmbeddings(collection, embeddings, weights)
 
-        # Concatenate embeddings with weights
-        embeddings_weighted = embeddings_np * weights_np[:, np.newaxis]
-
-        # Schreibe die restlichen Embeddings in die Milvus-Collection
-        collection.insert(data={'embedding': embeddings_weighted})
-        collection.flush()
-
-    # Trenne die Verbindung zu Milvus
     connections.disconnect("default")
 
     return embeddings
@@ -335,7 +354,6 @@ def index(index_filename='embedding_index.index'):
 
     print(faiss_index.ntotal)
 
-    # Fülle den Vektor mit den rekonstruierten Embeddings
     for i in range(faiss_index.ntotal):
         full_embedding[i] = faiss_index.reconstruct(i)
 
@@ -363,5 +381,6 @@ def store_embeddings_milvus():
     df = transformPartnerProgramsDataset(partnerprograms)
 
     product_embeddings = create_and_save_product_embeddings_to_milvus(df.head(100).iterrows())
+
 
 store_embeddings_milvus()

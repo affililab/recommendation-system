@@ -1,7 +1,9 @@
+import ast
 import random
 
 import pymongo
 import pandas as pd
+from bson import ObjectId
 from pymilvus.orm import utility
 from pymongo.mongo_client import MongoClient
 import os
@@ -10,7 +12,7 @@ import sys
 from sentence_transformers import SentenceTransformer, util
 import numpy as np
 import faiss
-from pymilvus import connections, Collection, FieldSchema, DataType, Milvus, CollectionSchema
+from pymilvus import connections, Collection, FieldSchema, DataType, Milvus, CollectionSchema, IndexType
 
 load_dotenv()
 
@@ -21,7 +23,7 @@ users = [
     {
         "firstname": "Julian",
         "lastname": "Bertsch",
-        "preferences": ["Sexual Happiness"],
+        "preferences": ["sexual happiness"],
         "pre_assets": ["Youtube-Channel", "Blog"],
         "pre_knowledge": ["Facebook Ads", "Google Ads", "SEO", "SEA"]
     }
@@ -36,7 +38,7 @@ def connect_to_mongodb():
         print("An Invalid URI host error was received. Is your Atlas host name correct in your connection string?")
         sys.exit(1)
 
-def getPartnerPrograms():
+def getPartnerPrograms(ids=[]):
     db_client = connect_to_mongodb()
     partnerprograms = []
     if db_client:
@@ -102,6 +104,13 @@ def getPartnerPrograms():
                 }
             }
         ]
+
+        if len(ids):
+            pipeline.append({
+            "$match": {
+                "_id": {"$in": ids}
+            }})
+
         cursor = collection_partnerprograms.aggregate(pipeline)
         partnerprograms = list(cursor)
     return partnerprograms
@@ -125,7 +134,9 @@ def transformPartnerProgramsDataset(partnerprograms):
         'directActivation'
     ]
 
-    subset_df = df[selection_df].copy()
+    # Use DataFrame.get to handle the case where the column doesn't exist
+    subset_df = pd.DataFrame({col: df.get(col, None) for col in selection_df})
+
 
     subset_df.loc[:, 'categories'] = df['resolved_categories'].apply(
         lambda x: [category.get('title') for category in x] if x else [])
@@ -140,57 +151,106 @@ def transformPartnerProgramsDataset(partnerprograms):
         lambda x: [item.get('title') for item in x] if x else [])
     subset_df.loc[:, 'advertisementAssets'] = df['resolved_advertisementAssets'].apply(
         lambda x: [item.get('title') for item in x] if x else [])
+
+    subset_df.loc[:, 'id'] = df['_id'].astype(str)
     return subset_df
 
-def retrieve_embeddings_from_milvus(collection_name='products', batch_size=1000):
+def create_index(collection, field_name='embedding'):
+    index_param = {
+        "index_type": 'IVF_FLAT',
+        "params": {"nlist": 1024},
+        "metric_type": 'COSINE'}
+    collection.create_index(field_name, index_param)
+    print("\nCreated index:\n{}".format(collection.index().params))
+
+def milvus_connect(collection_name='products'):
+    connections.connect(
+        alias="default",
+        host='localhost',
+        port='19530'
+    )
+    collection = Collection(name=collection_name)
+    collection.load()
+    return collection
+
+
+def retrieve_embeddings_from_milvus(collection_name='products'):
     connections.connect(
         alias="default",
         host='localhost',
         port='19530'
     )
 
+    dimension = model.encode("test").shape[0]
+
+
     collection = Collection(name=collection_name)
 
-    all_ids = []
-    offset = 0
-    ids = collection.list_id_array(limit=offset + batch_size)
-    while ids:
-        all_ids.extend(ids)
-        offset += batch_size
-        ids = collection.list_id_array(limit=offset + batch_size)
+    # Perform a range query to retrieve all embeddings
+    # results = collection.search(
+    #     data=[create_embeddings_user(users)[0]],
+    #     anns_field='embedding',
+    #     param={'nprobe': 16},
+    #     limit=10000
+    # )
 
-    all_embeddings = []
-    for batch_ids in all_ids:
-        embeddings = collection.get_entity_by_id(batch_ids)
-        all_embeddings.extend(embeddings)
+    # Load the collection
+    # collection.load()
 
-    connections.disconnect("default")
+    # Check the number of entities in the collection
+    num_entities = collection.num_entities
+    print(f"Number of entities in the collection: {num_entities}")
 
-    return np.array(all_embeddings, dtype=np.float32)
+    collection.load()
+
+    result = collection.query(expr="id >= 0", output_fields=['mongodb_id', 'embedding'])
+
+    return result
+
+def vector_similarity_search_user_products(user_embeddings):
+    collection = milvus_connect()
+    # result = collection.query(expr="id >= 0", output_fields=['mongodb_id', 'embedding'])
+    search_params = {"metric_type": "COSINE", "params": {"nprobe": 16}}
+    results = collection.search(
+        data=user_embeddings,
+        anns_field="embedding",
+        # the sum of `offset` in `param` and `limit`
+        # should be less than 16384.
+        param=search_params,
+        limit=5,
+        expr=None,
+        # set the names of the fields you want to
+        # retrieve from the search result.
+        output_fields=['mongodb_id'],
+        consistency_level="Strong"
+    )
+
+    results_elements = []
+    for entry in results[0]:
+        mongodb_id = entry.entity.get('mongodb_id')
+        results_elements.append({'mongodb_id': mongodb_id, 'similarity_score': entry.distance})
+    return results_elements
+
+
+
 
 def handleEmbeddings(collection, embeddings, weights):
-    embeddings_weighted = np.array(embeddings, dtype=np.float32)
+    ids = [item['mongodb_id'] for item in embeddings]
+    embeddings_data = [item['embedding'] for item in embeddings]
+    embeddings_weighted = np.array(embeddings_data, dtype=np.float32)
     weights_np = np.array(weights, dtype=np.float32)
 
-    # Debug prints
     print(f"Length of embeddings list: {len(embeddings)}")
     print(f"Shape of embeddings_weighted before weighting: {embeddings_weighted.shape}")
 
-    # Ensure that the dimensions match for weighting
     assert embeddings_weighted.shape[0] == len(
         embeddings), f"Unexpected batch size for remaining embeddings: {embeddings_weighted.shape[0]}"
 
-    # Ensure that the weights have the correct shape
     assert weights_np.shape[0] == len(embeddings), f"Unexpected length for weights: {weights_np.shape[0]}"
 
-    # Apply weights to each embedding vector
     embeddings_weighted *= weights_np[:, np.newaxis]
 
-    # Debug prints
     print(f"Shape of embeddings_weighted after weighting: {embeddings_weighted.shape}")
-
-    # Explicitly convert the entire batch to float32
-    # embeddings_weighted = embeddings_weighted.astype(np.float32)
 
     schema = collection.describe()
     print(schema)
@@ -203,8 +263,12 @@ def handleEmbeddings(collection, embeddings, weights):
         embeddings_weighted = embeddings_weighted.astype(np.float32)
     embeddings_weighted = embeddings_weighted.tolist()
 
+    print("embedding", embeddings_weighted[0])
+    print("ids", ids)
+
     try:
         data = [
+            ids,
             embeddings_weighted,
         ]
 
@@ -225,11 +289,13 @@ def create_and_save_product_embeddings_to_milvus(data, collection_name='products
         collection = Collection(name=collection_name)
     else:
         dimension = model.encode("test").shape[0]
-        field1 = FieldSchema(name='id', dtype=DataType.INT64, description="int64", is_primary=True, auto_id=True)
+        field1 = FieldSchema(name='mongodb_id', dtype=DataType.VARCHAR, description="id of item in mongodb", max_length=100)
         field2 = FieldSchema(name='embedding', dtype=DataType.FLOAT_VECTOR, description="float vector", dim=dimension,
                              is_primary=False)
-        schema = CollectionSchema(fields=[field1, field2], description="collection description")
-        collection = Collection(name=collection_name, data=None, schema=schema, properties={"collection.ttl.seconds": 15})
+        field3 = FieldSchema(name='id', dtype=DataType.INT64, description="int64", is_primary=True, auto_id=True)
+        schema = CollectionSchema(fields=[field1, field2, field3], description="collection description")
+        collection = Collection(name=collection_name, data=None, schema=schema)
+        create_index(collection)
 
     embeddings = []
     weights = []
@@ -262,11 +328,11 @@ def create_and_save_product_embeddings_to_milvus(data, collection_name='products
 
         # print(entry['title'] + " " + str(weight))
 
-        print(i)
+        print(i, str(entry._id))
 
         record_id = i
         embedding = model.encode(combined_data)
-        embeddings.append(embedding)
+        embeddings.append({ "mongodb_id":  str(entry._id), "embedding": embedding })
         weights.append(weight)
 
         if i % batch_size == 0 and i > 0:
@@ -315,21 +381,16 @@ def create_product_embeddings(data, index_filename='embedding_index.index'):
         embedding = model.encode(combined_data)
         embeddings.append(embedding)
         weights.append(weight)
-        print(i)
 
-    # Initialize the Faiss index
     embeddings_np = np.array(embeddings, dtype=np.float32)
     weights_np = np.array(weights, dtype=np.float32)
 
-    # Concatenate embeddings with weights
     embeddings_weighted = embeddings_np * weights_np[:, np.newaxis]
 
     index = faiss.IndexFlatL2(embeddings_weighted.shape[1])
 
-    # Add embeddings to the index
     index.add(embeddings_weighted)
 
-        # Save the index to a file
     faiss.write_index(index, index_filename)
     return embeddings
 
@@ -341,41 +402,53 @@ def create_embeddings_user(data):
         embeddings.append(embedding)
     return embeddings
 
-def index(index_filename='embedding_index.index'):
-    partnerprograms = getPartnerPrograms()
-    df = transformPartnerProgramsDataset(partnerprograms)
+def index():
     user_embeddings = create_embeddings_user(users)
+    products = retrieve_embeddings_from_milvus()
+    embeddings_data = [item['embedding'] for item in products]
 
-    # Load the Faiss index
-    faiss_index = faiss.read_index(index_filename)
+    if embeddings_data:
+        print("results")
 
-    full_embedding = np.zeros((faiss_index.ntotal, faiss_index.d), dtype=np.float32)
+        similarities_matrix = util.pytorch_cos_sim(np.array(user_embeddings), embeddings_data)
 
+        recommended_products = []
 
-    print(faiss_index.ntotal)
-
-    for i in range(faiss_index.ntotal):
-        full_embedding[i] = faiss_index.reconstruct(i)
-
-    similarities_matrix = util.pytorch_cos_sim(np.array(user_embeddings), np.array(full_embedding))
-
-
-    #Iterate through users and products to print similarity scores
-    for user_idx, user in enumerate(users):
-        user_similarity_scores = similarities_matrix[user_idx].numpy()
+        user_similarity_scores = similarities_matrix[0].numpy()
         top_n_indices = np.argsort(user_similarity_scores)[::-1][:5]
         # Display the recommendations
-        print(f"Top 5 Recommendations for User '{user['firstname']} {user['lastname']}':")
         for product_idx in top_n_indices:
-            product = df.iloc[product_idx]
+            product = products[product_idx]
+            recommended_products.append({'mongodb_id': product['mongodb_id'], 'similarity_score': user_similarity_scores[product_idx]})
+        recommended_ids = [ObjectId(item['mongodb_id']) for item in recommended_products]
+        recommended_items = getPartnerPrograms(recommended_ids)
+        df = transformPartnerProgramsDataset(recommended_items)
+        for product in recommended_products:
+            desired_id = str(product['mongodb_id'])
+            index = df.index[df['id'] == desired_id].tolist()[0]
+            desired_element = df.iloc[index]
             print(
-                f"  - {product['title']} '{','.join(product['categories'])}' with similarity score: {user_similarity_scores[product_idx]:.4f}")
+                f"  - {desired_element['title']} '{','.join(desired_element['categories'])}' with similarity score: {product['similarity_score']:.4f}")
+    else:
+        print("empty result")
+
+def index_vector_search_on_milvus():
+    user_embeddings = create_embeddings_user(users)
+    recommended_items = vector_similarity_search_user_products(user_embeddings)
+    recommended_ids = [ObjectId(item['mongodb_id']) for item in recommended_items]
+    recommended_items_db = getPartnerPrograms(recommended_ids)
+    df = transformPartnerProgramsDataset(recommended_items_db)
+    for item in recommended_items:
+        index = df.index[df['id'] == item['mongodb_id']].tolist()[0]
+        desired_element = df.iloc[index]
+        print(f"  - {item['mongodb_id']} {desired_element['title']} '{','.join(desired_element['categories'])}' with similarity score: {item['similarity_score']:.4f}")
+
 
 def store_embeddings():
     partnerprograms = getPartnerPrograms()
     df = transformPartnerProgramsDataset(partnerprograms)
 
-    product_embeddings = create_product_embeddings(df.iterrows())
+    product_embeddings = create_product_embeddings(df.head(100).iterrows())
 def store_embeddings_milvus():
     partnerprograms = getPartnerPrograms()
     df = transformPartnerProgramsDataset(partnerprograms)
@@ -383,4 +456,4 @@ def store_embeddings_milvus():
     product_embeddings = create_and_save_product_embeddings_to_milvus(df.head(100).iterrows())
 
 
-store_embeddings_milvus()
+index_vector_search_on_milvus()

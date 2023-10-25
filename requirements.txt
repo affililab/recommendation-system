@@ -1,7 +1,9 @@
+faiss==1.5.3
+Flask==3.0.0
+flask_restful==0.3.10
 numpy==1.24.2
 pandas==2.0.3
+pymilvus==2.3.0
 pymongo==3.12.0
 python-dotenv==1.0.0
 sentence_transformers==2.2.2
-
-pymilvus~=2.3.1

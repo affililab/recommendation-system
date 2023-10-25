@@ -1,33 +1,21 @@
-import ast
-import random
+import os
+import sys
 
-import pymongo
+import faiss
+import numpy as np
 import pandas as pd
+import pymongo
 from bson import ObjectId
+from dotenv import load_dotenv
+from pymilvus import connections, Collection, FieldSchema, DataType, CollectionSchema
 from pymilvus.orm import utility
 from pymongo.mongo_client import MongoClient
-import os
-from dotenv import load_dotenv
-import sys
 from sentence_transformers import SentenceTransformer, util
-import numpy as np
-import faiss
-from pymilvus import connections, Collection, FieldSchema, DataType, Milvus, CollectionSchema, IndexType
 
 load_dotenv()
 
 # Load SBERT-Model
 model = SentenceTransformer('paraphrase-multilingual-mpnet-base-v2', device='cpu')
-
-users = [
-    {
-        "firstname": "Julian",
-        "lastname": "Bertsch",
-        "preferences": ["sexual happiness"],
-        "pre_assets": ["Youtube-Channel", "Blog"],
-        "pre_knowledge": ["Facebook Ads", "Google Ads", "SEO", "SEA"]
-    }
-]
 
 
 def connect_to_mongodb():
@@ -114,6 +102,24 @@ def getPartnerPrograms(ids=[]):
         cursor = collection_partnerprograms.aggregate(pipeline)
         partnerprograms = list(cursor)
     return partnerprograms
+
+def getUserPreferencesById(id):
+    db_client = connect_to_mongodb()
+    preferredCategories = []
+    if db_client:
+        db = db_client[os.getenv('DB_MONGODB_DATABASE')]
+        users_collection = db["users"]
+        categories_collection = db["categorygroups"]
+        if not isinstance(id, ObjectId):
+            id = ObjectId(id)
+        user = users_collection.find_one({"_id": id})
+        if user and 'preferred' in user:
+            preferred = user['preferred']
+            # Manually populate 'preferred.categories' using a separate query
+            categories_cursor = categories_collection.find({"_id": {"$in": preferred['categories']}})
+            preferredCategories = list(categories_cursor)
+    return [category['title'] for category in preferredCategories]
+
 
 def transformPartnerProgramsDataset(partnerprograms):
     df = pd.DataFrame(partnerprograms)
@@ -232,6 +238,29 @@ def vector_similarity_search_user_products(user_embeddings):
     return results_elements
 
 
+def vector_similarity_search_preferences_products(preferences_embedding):
+    collection = milvus_connect()
+    # result = collection.query(expr="id >= 0", output_fields=['mongodb_id', 'embedding'])
+    search_params = {"metric_type": "COSINE", "params": {"nprobe": 16}}
+    results = collection.search(
+        data=[preferences_embedding],
+        anns_field="embedding",
+        # the sum of `offset` in `param` and `limit`
+        # should be less than 16384.
+        param=search_params,
+        limit=5,
+        expr=None,
+        # set the names of the fields you want to
+        # retrieve from the search result.
+        output_fields=['mongodb_id'],
+        consistency_level="Strong"
+    )
+
+    results_elements = []
+    for entry in results[0]:
+        mongodb_id = entry.entity.get('mongodb_id')
+        results_elements.append({'mongodb_id': mongodb_id, 'similarity_score': entry.distance})
+    return results_elements
 
 
 def handleEmbeddings(collection, embeddings, weights):
@@ -402,8 +431,56 @@ def create_embeddings_user(data):
         embeddings.append(embedding)
     return embeddings
 
+def create_embeddings_user_preferences(preferences):
+    categories = ",".join(preferences)
+
+    # weightings
+    category_weight = 2.0
+    # preference_weight = 1.0
+    # tools_weight = 1.0
+    # channels_weight = 1.0
+
+    weighted_embedding = (
+            category_weight * model.encode(categories)
+            # preference_weight * model.encode(preferences_section) +
+            # tools_weight * model.encode(tools_section) +
+            # channels_weight * model.encode(channels_section)
+    )
+    return weighted_embedding
+
+def create_embeddings_categories(categories):
+    categories = ",".join(categories)
+
+    # weightings
+    category_weight = 2.0
+
+    weighted_embedding = (
+            category_weight * model.encode(categories)
+    )
+    return weighted_embedding
+
+def create_embeddings_preferences(preferences):
+    categories = ",".join(preferences['categories'])
+    preferences_section = ",".join(preferences['preferences'])
+    tools_section = ",".join(preferences['tools_categories'])
+    channels_section = ",".join(preferences['marketing_channels'])
+
+    # weightings
+    category_weight = 2.0
+    preference_weight = 1.0
+    tools_weight = 1.0
+    channels_weight = 1.0
+
+    weighted_embedding = (
+            category_weight * model.encode(categories) +
+            preference_weight * model.encode(preferences_section) +
+            tools_weight * model.encode(tools_section) +
+            channels_weight * model.encode(channels_section)
+    )
+    return weighted_embedding
+
 def index():
-    user_embeddings = create_embeddings_user(users)
+    user_embeddings = create_embeddings_user([])
     products = retrieve_embeddings_from_milvus()
     embeddings_data = [item['embedding'] for item in products]
 
@@ -433,15 +510,68 @@ def index():
         print("empty result")
 
 def index_vector_search_on_milvus():
-    user_embeddings = create_embeddings_user(users)
+    user_embeddings = create_embeddings_user([])
     recommended_items = vector_similarity_search_user_products(user_embeddings)
     recommended_ids = [ObjectId(item['mongodb_id']) for item in recommended_items]
     recommended_items_db = getPartnerPrograms(recommended_ids)
     df = transformPartnerProgramsDataset(recommended_items_db)
+    result = []
     for item in recommended_items:
         index = df.index[df['id'] == item['mongodb_id']].tolist()[0]
         desired_element = df.iloc[index]
         print(f"  - {item['mongodb_id']} {desired_element['title']} '{','.join(desired_element['categories'])}' with similarity score: {item['similarity_score']:.4f}")
+        result.append({'mongodb_id': item['mongodb_id'], 'title': desired_element['title'], 'similarity_score': item['similarity_score']})
+    return result
+
+def recommendation_wizzard(preferences):
+
+    preferences_embedding = create_embeddings_preferences(preferences)
+
+    recommended_items = vector_similarity_search_preferences_products(preferences_embedding)
+    recommended_ids = [ObjectId(item['mongodb_id']) for item in recommended_items]
+    recommended_items_db = getPartnerPrograms(recommended_ids)
+    df = transformPartnerProgramsDataset(recommended_items_db)
+    result = []
+    for item in recommended_items:
+        index = df.index[df['id'] == item['mongodb_id']].tolist()[0]
+        desired_element = df.iloc[index]
+        print(f"  - {item['mongodb_id']} {desired_element['title']} '{','.join(desired_element['categories'])}' with similarity score: {item['similarity_score']:.4f}")
+        result.append({'mongodb_id': item['mongodb_id'], 'title': desired_element['title'], 'categories': desired_element['categories'], 'similarity_score': item['similarity_score']})
+    return result
+
+def recommendation_user(id):
+    preferences = getUserPreferencesById(id)
+    print(preferences)
+
+    preferences_embedding = create_embeddings_user_preferences(preferences)
+
+    recommended_items = vector_similarity_search_preferences_products(preferences_embedding)
+    recommended_ids = [ObjectId(item['mongodb_id']) for item in recommended_items]
+    recommended_items_db = getPartnerPrograms(recommended_ids)
+    df = transformPartnerProgramsDataset(recommended_items_db)
+    result = []
+    for item in recommended_items:
+        index = df.index[df['id'] == item['mongodb_id']].tolist()[0]
+        desired_element = df.iloc[index]
+        print(f"  - {item['mongodb_id']} {desired_element['title']} '{','.join(desired_element['categories'])}' with similarity score: {item['similarity_score']:.4f}")
+        result.append({'mongodb_id': item['mongodb_id'], 'title': desired_element['title'], 'categories': desired_element['categories'], 'similarity_score': item['similarity_score']})
+    return result
+
+def recommendation_categories(categories):
+
+    preferences_embedding = create_embeddings_categories(categories)
+
+    recommended_items = vector_similarity_search_preferences_products(preferences_embedding)
+    recommended_ids = [ObjectId(item['mongodb_id']) for item in recommended_items]
+    recommended_items_db = getPartnerPrograms(recommended_ids)
+    df = transformPartnerProgramsDataset(recommended_items_db)
+    result = []
+    for item in recommended_items:
+        index = df.index[df['id'] == item['mongodb_id']].tolist()[0]
+        desired_element = df.iloc[index]
+        print(f"  - {item['mongodb_id']} {desired_element['title']} '{','.join(desired_element['categories'])}' with similarity score: {item['similarity_score']:.4f}")
+        result.append({'mongodb_id': item['mongodb_id'], 'title': desired_element['title'], 'categories': desired_element['categories'], 'similarity_score': item['similarity_score']})
+    return result
 
 
 def store_embeddings():
@@ -455,5 +585,5 @@ def store_embeddings_milvus():
 
     product_embeddings = create_and_save_product_embeddings_to_milvus(df.head(100).iterrows())
 
-
-index_vector_search_on_milvus()
+if __name__ == '__main__':
+    index_vector_search_on_milvus()

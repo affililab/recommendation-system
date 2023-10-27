@@ -8,6 +8,7 @@ api = Api(app)
 class RecommendationSystem(Resource):
     def post(self):
         data = request.get_json()
+        print(data)
         recommends = main.recommendation_wizzard(data)
         # recommends = main.index_vector_search_on_milvus()
         return recommends

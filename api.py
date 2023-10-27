@@ -30,4 +30,4 @@ api.add_resource(RecommendationSystemUserPreferences, '/recommendation-user')
 api.add_resource(RecommendationSystemCategories, '/recommendation-categories')
 
 if __name__ == '__main__':
-    app.run(debug=True)
+    app.run(host='0.0.0.0')

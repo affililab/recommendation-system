@@ -20,6 +20,7 @@ model = SentenceTransformer('paraphrase-multilingual-mpnet-base-v2', device='cpu
 
 def connect_to_mongodb():
     try:
+        print(os.getenv('DB_MONGODB_CONNECTION'))
         client = MongoClient(os.getenv('DB_MONGODB_CONNECTION'), connect=False)
         return client
     except pymongo.errors.ConfigurationError:
@@ -583,7 +584,7 @@ def store_embeddings_milvus():
     partnerprograms = getPartnerPrograms()
     df = transformPartnerProgramsDataset(partnerprograms)
 
-    product_embeddings = create_and_save_product_embeddings_to_milvus(df.head(100).iterrows())
+    product_embeddings = create_and_save_product_embeddings_to_milvus(df.iterrows())
 
 if __name__ == '__main__':
-    index_vector_search_on_milvus()
+    store_embeddings_milvus()

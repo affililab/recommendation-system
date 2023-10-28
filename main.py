@@ -177,8 +177,8 @@ def create_index(collection, field_name='embedding'):
 def milvus_connect(collection_name='products'):
     connections.connect(
         alias="default",
-        host='localhost',
-        port='19530'
+        host=os.getenv('MILVUS_DATABASE_HOST'),
+        port=os.getenv('MILVUS_DATABASE_PORT')
     )
     collection = Collection(name=collection_name)
     collection.load()
@@ -186,15 +186,7 @@ def milvus_connect(collection_name='products'):
 
 
 def retrieve_embeddings_from_milvus(collection_name='products'):
-    connections.connect(
-        alias="default",
-        host='localhost',
-        port='19530'
-    )
-
-    dimension = model.encode("test").shape[0]
-
-    collection = Collection(name=collection_name)
+    collection = milvus_connect(collection_name)
 
     # Perform a range query to retrieve all embeddings
     # results = collection.search(
@@ -218,45 +210,17 @@ def retrieve_embeddings_from_milvus(collection_name='products'):
     return result
 
 
-def vector_similarity_search_user_products(user_embeddings):
-    collection = milvus_connect()
-    # result = collection.query(expr="id >= 0", output_fields=['mongodb_id', 'embedding'])
-    search_params = {"metric_type": "COSINE", "params": {"nprobe": 16}}
-    results = collection.search(
-        data=user_embeddings,
-        anns_field="embedding",
-        # the sum of `offset` in `param` and `limit`
-        # should be less than 16384.
-        param=search_params,
-        limit=5,
-        expr=None,
-        # set the names of the fields you want to
-        # retrieve from the search result.
-        output_fields=['mongodb_id'],
-        consistency_level="Strong"
-    )
-
-    results_elements = []
-    for entry in results[0]:
-        mongodb_id = entry.entity.get('mongodb_id')
-        results_elements.append({'mongodb_id': mongodb_id, 'similarity_score': entry.distance})
-    return results_elements
-
 
 def vector_similarity_search_preferences_products(preferences_embedding):
     collection = milvus_connect()
-    # result = collection.query(expr="id >= 0", output_fields=['mongodb_id', 'embedding'])
+
     search_params = {"metric_type": "COSINE", "params": {"nprobe": 16}}
     results = collection.search(
         data=[preferences_embedding],
         anns_field="embedding",
-        # the sum of `offset` in `param` and `limit`
-        # should be less than 16384.
         param=search_params,
-        limit=5,
+        limit=10,
         expr=None,
-        # set the names of the fields you want to
-        # retrieve from the search result.
         output_fields=['mongodb_id'],
         consistency_level="Strong"
     )
@@ -282,7 +246,11 @@ def handleEmbeddings(collection, embeddings, weights):
 
     assert weights_np.shape[0] == len(embeddings), f"Unexpected length for weights: {weights_np.shape[0]}"
 
-    embeddings_weighted *= weights_np[:, np.newaxis]
+    weights_sum = sum(weights)
+    normalized_weights = np.array([w / weights_sum for w in weights_np])
+
+    embeddings_weighted *= normalized_weights[:, np.newaxis]
+
 
     print(f"Shape of embeddings_weighted after weighting: {embeddings_weighted.shape}")
 
@@ -312,11 +280,11 @@ def handleEmbeddings(collection, embeddings, weights):
         print(f"Error during insert operation: {e}")
 
 
-def create_and_save_product_embeddings_to_milvus(data, collection_name='products', batch_size=10):
+def create_and_save_product_embeddings_to_milvus(data, collection_name='products', batch_size=1000):
     connections.connect(
         alias="default",
-        host='localhost',
-        port='19530'
+        host=os.getenv('MILVUS_DATABASE_HOST'),
+        port=os.getenv('MILVUS_DATABASE_PORT')
     )
 
     if collection_name in utility.list_collections():
@@ -349,6 +317,7 @@ def create_and_save_product_embeddings_to_milvus(data, collection_name='products
         else:
             combined_data += "no"
 
+        commissionSettingsAvailable = False
         weight += (0.01 * len(entry["advertisementAssets"]))
         if (entry.get("trackingLifetime")
                 and isinstance(entry["trackingLifetime"], (int, float))
@@ -357,15 +326,13 @@ def create_and_save_product_embeddings_to_milvus(data, collection_name='products
         if (entry.get("commissionInPercent")
                 and isinstance(entry["commissionInPercent"], (int, float))
                 and not math.isnan(entry["commissionInPercent"])):
-            weight += (0.1 * entry["commissionInPercent"])
+            weight += (2 * entry["commissionInPercent"])
+            commissionSettingsAvailable = True
         else:
             if (isinstance(entry["commissionFixed"], (int, float))
                     and not math.isnan(entry["commissionFixed"])):
-                weight += (0.2 * entry.get("commissionFixed", 0.0))
-
-        # TODO: created newer ones higher weighted
-        if 'created' in entry:
-            weight += 0.1 / (1 + (current_timestamp - entry['created']))  # Assuming current_timestamp is the current time
+                weight += (0.5 * entry.get("commissionFixed", 0.0))
+                commissionSettingsAvailable = True
 
         # TODO: lastUpdated newer ones higher weighted
         if 'lastUpdated' in entry:
@@ -377,12 +344,16 @@ def create_and_save_product_embeddings_to_milvus(data, collection_name='products
         # TODO: rating : higher is better
         rating = entry.get('rating', 0.0)
         if isinstance(rating, (int, float)) and not math.isnan(rating):
-            weight += rating
-
-        # TODO: reviews : more is better
-        reviews = entry.get('reviews', 0.0)
-        if isinstance(reviews, (int, float)) and not math.isnan(reviews):
-            weight += reviews
+            print("rating", rating)
+            weight += 200 * rating
+            # TODO: reviews : more is better
+            reviews = entry.get('reviews', 0.0)
+            if isinstance(reviews, (int, float)) and not math.isnan(reviews):
+                weight += 0.01 * reviews
+        else:
+            # reduce non ranked products
+            weight *= 0.5
+            print("weights reduced")
 
         # TODO: semAllowed : should be higher weighted if true
         if entry.get('semAllowed', False):
@@ -393,20 +364,25 @@ def create_and_save_product_embeddings_to_milvus(data, collection_name='products
 
         # TODO: trackingTypeSession : if true it should be lower weighted than when trackingLifetime is set
         if entry.get('trackingTypeSession', False):
-            weight *= 0.8
+            weight *= 0.9
 
         # TODO: trackingTypes : the more the better, array elements
         tracking_types = entry.get('trackingTypes', [])
         if isinstance(tracking_types, list):
-            weight += 0.05 * len(tracking_types)
+            weight += 0.01 * len(tracking_types)
 
         # Adjust weight for empty description
         if 'description' not in entry or not entry['description']:
-            weight *= 0.5
+            if (entry['description'] == ""):
+                weight = -1
+        if not commissionSettingsAvailable:
+            weight = -1
 
         embedding = model.encode(combined_data)
         embeddings.append({"mongodb_id": str(entry._id), "embedding": embedding})
         weights.append(weight)
+
+        print(i, str(entry._id), entry.title, entry.rating, weight)
 
         if i % batch_size == 0 and i > 0:
             handleEmbeddings(collection, embeddings, weights)
@@ -516,19 +492,28 @@ def create_embeddings_preferences(preferences):
     channels_section = ",".join(preferences['marketing_channels'])
 
     # weightings
-    category_weight = 5.0
-    category_groups_weight = 4.0
+    category_weight = 10.0
+    category_groups_weight = 2.0
     preference_weight = 1.0
     tools_weight = 1.0
     channels_weight = 1.0
 
+    # normalize weights
+    total_weight = category_weight + category_groups_weight + preference_weight + tools_weight + channels_weight
+    normalized_category_weight = category_weight / total_weight
+    normalized_category_groups_weight = category_groups_weight / total_weight
+    normalized_preference_weight = preference_weight / total_weight
+    normalized_tools_weight = tools_weight / total_weight
+    normalized_channels_weight = channels_weight / total_weight
+
     weighted_embedding = (
-            category_weight * model.encode(categories) +
-            category_groups_weight * model.encode(category_groups) +
-            preference_weight * model.encode(preferences_section) +
-            tools_weight * model.encode(tools_section) +
-            channels_weight * model.encode(channels_section)
+            normalized_category_weight * model.encode(categories) +
+            normalized_category_groups_weight * model.encode(category_groups) +
+            normalized_preference_weight * model.encode(preferences_section) +
+            normalized_tools_weight * model.encode(tools_section) +
+            normalized_channels_weight * model.encode(channels_section)
     )
+
     return weighted_embedding
 
 
@@ -545,7 +530,7 @@ def index():
         recommended_products = []
 
         user_similarity_scores = similarities_matrix[0].numpy()
-        top_n_indices = np.argsort(user_similarity_scores)[::-1][:5]
+        top_n_indices = np.argsort(user_similarity_scores)[::-1][:10]
         # Display the recommendations
         for product_idx in top_n_indices:
             product = products[product_idx]
@@ -563,24 +548,6 @@ def index():
     else:
         print("empty result")
 
-
-def index_vector_search_on_milvus():
-    user_embeddings = create_embeddings_user([])
-    recommended_items = vector_similarity_search_user_products(user_embeddings)
-    recommended_ids = [ObjectId(item['mongodb_id']) for item in recommended_items]
-    recommended_items_db = getPartnerPrograms(recommended_ids)
-    df = transformPartnerProgramsDataset(recommended_items_db)
-    result = []
-    for item in recommended_items:
-        index = df.index[df['id'] == item['mongodb_id']].tolist()[0]
-        desired_element = df.iloc[index]
-        print(
-            f"  - {item['mongodb_id']} {desired_element['title']} '{','.join(desired_element['categories'])}' with similarity score: {item['similarity_score']:.4f}")
-        result.append({'mongodb_id': item['mongodb_id'], 'title': desired_element['title'],
-                       'similarity_score': item['similarity_score']})
-    return result
-
-
 def recommendation_wizzard(preferences):
     preferences_embedding = create_embeddings_preferences(preferences)
 
@@ -592,6 +559,8 @@ def recommendation_wizzard(preferences):
     for item in recommended_items:
         index = df.index[df['id'] == item['mongodb_id']].tolist()[0]
         desired_element = df.iloc[index]
+        print(
+            f"  - {item['mongodb_id']} {desired_element['title']} '{','.join(desired_element['categories'])}' with similarity score: {item['similarity_score']:.4f}")
         result.append({'mongodb_id': item['mongodb_id'], 'title': desired_element['title'],
                        'categories': desired_element['categories'], 'similarity_score': item['similarity_score']})
     return result

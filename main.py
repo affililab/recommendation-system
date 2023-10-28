@@ -493,7 +493,7 @@ def create_embeddings_preferences(preferences):
 
     # weightings
     category_weight = 10.0
-    category_groups_weight = 10.0
+    category_groups_weight = 5.0
     preference_weight = 1.0
     tools_weight = 1.0
     channels_weight = 1.0

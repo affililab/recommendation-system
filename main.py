@@ -341,20 +341,6 @@ def create_and_save_product_embeddings_to_milvus(data, collection_name='products
         # TODO: products implement to combined_data : is Array of strings
         combined_data += ", Products: " + ",".join(entry.get('products', []))
 
-        # TODO: rating : higher is better
-        rating = entry.get('rating', 0.0)
-        if isinstance(rating, (int, float)) and not math.isnan(rating):
-            print("rating", rating)
-            weight += 200 * rating
-            # TODO: reviews : more is better
-            reviews = entry.get('reviews', 0.0)
-            if isinstance(reviews, (int, float)) and not math.isnan(reviews):
-                weight += 0.01 * reviews
-        else:
-            # reduce non ranked products
-            weight *= 0.5
-            print("weights reduced")
-
         # TODO: semAllowed : should be higher weighted if true
         if entry.get('semAllowed', False):
             weight += 0.2
@@ -371,12 +357,26 @@ def create_and_save_product_embeddings_to_milvus(data, collection_name='products
         if isinstance(tracking_types, list):
             weight += 0.01 * len(tracking_types)
 
+        # TODO: rating : higher is better
+        rating = entry.get('rating', 0.0)
+        if isinstance(rating, (int, float)) and not math.isnan(rating):
+            print("rating", rating)
+            weight += 200 * rating
+            # TODO: reviews : more is better
+            reviews = entry.get('reviews', 0.0)
+            if isinstance(reviews, (int, float)) and not math.isnan(reviews):
+                weight += 0.01 * reviews
+        else:
+            # reduce non ranked products
+            weight *= 0.1
+            print("weights reduced")
+
         # Adjust weight for empty description
         if 'description' not in entry or not entry['description']:
             if (entry['description'] == ""):
-                weight = -1
+                weight = 0
         if not commissionSettingsAvailable:
-            weight = -1
+            weight = 0
 
         embedding = model.encode(combined_data)
         embeddings.append({"mongodb_id": str(entry._id), "embedding": embedding})
@@ -493,7 +493,7 @@ def create_embeddings_preferences(preferences):
 
     # weightings
     category_weight = 10.0
-    category_groups_weight = 2.0
+    category_groups_weight = 10.0
     preference_weight = 1.0
     tools_weight = 1.0
     channels_weight = 1.0
@@ -549,6 +549,7 @@ def index():
         print("empty result")
 
 def recommendation_wizzard(preferences):
+
     preferences_embedding = create_embeddings_preferences(preferences)
 
     recommended_items = vector_similarity_search_preferences_products(preferences_embedding)

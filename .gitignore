@@ -3,4 +3,5 @@
 venv
 myproject.sock
 __pycache__
+collaborative_model.pth
 

@@ -5,6 +5,7 @@ import database
 from torch.utils.data import DataLoader, TensorDataset
 from sklearn.model_selection import train_test_split
 from bson import ObjectId
+import os
 
 
 class CollaborativeFilteringModel(nn.Module):
@@ -20,6 +21,17 @@ class CollaborativeFilteringModel(nn.Module):
         concatenated = torch.cat([user_embedded, product_embedded], dim=1)
         output = self.fc(concatenated)
         return output
+
+def save_model(model, num_users, num_products, path='collaborative_model.pth'):
+    # Save the model with additional information about num_users and num_products
+    torch.save({'model_state_dict': model.state_dict(), 'num_users': num_users, 'num_products': num_products}, path)
+
+def load_model(path='collaborative_model.pth'):
+    # Load the model and return it along with num_users and num_products
+    checkpoint = torch.load(path)
+    model = CollaborativeFilteringModel(num_users=checkpoint['num_users'], num_products=checkpoint['num_products'])
+    model.load_state_dict(checkpoint['model_state_dict'])
+    return model, checkpoint['num_users'], checkpoint['num_products']
 
 def train_collaborative_filtering_model(user_product_interactions, user_id_mapping, product_id_mapping):
     user_ids_tensor = torch.LongTensor(
@@ -91,6 +103,15 @@ def recommend_for_user(user_id, model, user_id_mapping, product_id_mapping):
 
     return recommendations
 
+def handle_new_users(model, new_user_ids, user_id_mapping):
+    # Initialize embeddings for new users
+    new_user_mapping = {user_id: len(user_id_mapping) + i for i, user_id in enumerate(new_user_ids)}
+    model.user_embedding.weight.data = torch.cat([
+        model.user_embedding.weight.data,
+        torch.randn(len(new_user_ids), model.user_embedding.embedding_dim)
+    ])
+    return new_user_mapping
+
 def get_recommendations_for_user(user_id):
     # get interactions
     user_product_interactions, unique_user_ids, unique_product_ids, num_users, num_products = database.get_user_product_interactions()
@@ -98,10 +119,39 @@ def get_recommendations_for_user(user_id):
     product_id_mapping = {product_id: i for i, product_id in enumerate(unique_product_ids)}
     user_id_mapping = {user_id: i for i, user_id in enumerate(unique_user_ids)}
 
-    # Train collaborative filtering model
-    model = train_collaborative_filtering_model(user_product_interactions, user_id_mapping, product_id_mapping)
+    # Load the saved model
+    model_path = 'collaborative_model.pth'
+    if os.path.exists(model_path):
+        model, num_users, num_products = load_model(path=model_path)
+    else:
+        # Train collaborative filtering model if the model doesn't exist
+        model = train_collaborative_filtering_model(user_product_interactions, user_id_mapping, product_id_mapping)
+        num_users, num_products = len(user_id_mapping), len(product_id_mapping)
+        # Save the trained model
+        save_model(model, num_users=num_users, num_products=num_products, path=model_path)
 
-    # Get recommendations for a specific user
+    # Check if the user_id is in the user_id_mapping
+    if user_id not in user_id_mapping:
+        # Handle new user: Update the model and mappings
+        new_user_ids = [user_id]
+        new_user_mapping = handle_new_users(model, new_user_ids, user_id_mapping)
+        user_id_mapping.update(new_user_mapping)
+
+        # Update product_ids_tensor with the new user
+        user_ids_tensor = torch.LongTensor(
+            [user_id_mapping[str(interaction['user_id'])] for interaction in user_product_interactions])
+        product_ids_tensor = torch.LongTensor(
+            [product_id_mapping[str(interaction['product_id'])] for interaction in user_product_interactions])
+        interactions_tensor = torch.FloatTensor(
+            [1 if interaction['interaction'] > 0 else 0 for interaction in user_product_interactions])
+
+        # Train the model with the new user
+        model = train_collaborative_filtering_model(user_product_interactions, user_id_mapping, product_id_mapping)
+        num_users, num_products = len(user_id_mapping), len(product_id_mapping)
+        # Save the updated model
+        save_model(model, num_users=num_users, num_products=num_products, path=model_path)
+
+    # Get recommendations for the specified user
     recommendations = recommend_for_user(user_id, model, user_id_mapping, product_id_mapping)
 
     recommended_ids = [ObjectId(product_id) for product_id, predicted_interaction in recommendations[:10]]

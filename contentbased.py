@@ -228,14 +228,15 @@ def create_and_save_product_embeddings_to_milvus(data, collection_name='products
                 weight += (0.5 * entry.get("commissionFixed", 0.0))
                 commissionSettingsAvailable = True
 
-        # TODO: lastUpdated newer ones higher weighted
+        #lastUpdated newer ones higher weighted
         if 'lastUpdated' in entry:
-            weight += 0.1 / (1 + (current_timestamp - entry['lastUpdated']))  # Assuming current_timestamp is the current time
+            weight += 0.1 / (1 + (current_timestamp - entry['lastUpdated']))
 
-        # TODO: products implement to combined_data : is Array of strings
-        combined_data += ", Products: " + ",".join(entry.get('products', []))
+        if (len(entry.get("products", []) )):
+            #products implement to combined_data : is Array of strings
+            combined_data += ", Products: " + ",".join(entry.get('products', []))
 
-        # TODO: semAllowed : should be higher weighted if true
+        #semAllowed : should be higher weighted if true
         if entry.get('semAllowed', False):
             weight += 0.2
 
@@ -510,6 +511,7 @@ def store_embeddings():
 def store_embeddings_milvus():
     partnerprograms = getPartnerPrograms()
     df = transformPartnerProgramsDataset(partnerprograms)
+    print(df['semHints'].dtypes)
 
     product_embeddings = create_and_save_product_embeddings_to_milvus(df.iterrows())
 

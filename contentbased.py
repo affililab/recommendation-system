@@ -240,24 +240,24 @@ def create_and_save_product_embeddings_to_milvus(data, collection_name='products
         if entry.get('semAllowed', False):
             weight += 0.2
 
-        # TODO: semHints : is Array of strings should be included in combined data
+        # semHints : is Array of strings should be included in combined data
         combined_data += ", SEM Hints: " + ",".join(entry.get('semHints', []))
 
-        # TODO: trackingTypeSession : if true it should be lower weighted than when trackingLifetime is set
+        # trackingTypeSession : if true it should be lower weighted than when trackingLifetime is set
         if entry.get('trackingTypeSession', False):
             weight *= 0.9
 
-        # TODO: trackingTypes : the more the better, array elements
+        # trackingTypes : the more the better, array elements
         tracking_types = entry.get('trackingTypes', [])
         if isinstance(tracking_types, list):
             weight += 0.01 * len(tracking_types)
 
-        # TODO: rating : higher is better
+        # rating : higher is better
         rating = entry.get('rating', 0.0)
         if isinstance(rating, (int, float)) and not math.isnan(rating):
             print("rating", rating)
             weight += 200 * rating
-            # TODO: reviews : more is better
+            # reviews : more is better
             reviews = entry.get('reviews', 0.0)
             if isinstance(reviews, (int, float)) and not math.isnan(reviews):
                 weight += 0.01 * reviews

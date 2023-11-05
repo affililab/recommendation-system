@@ -1,11 +1,11 @@
+import os
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import database
-from torch.utils.data import DataLoader, TensorDataset
-from sklearn.model_selection import train_test_split
 from bson import ObjectId
-import os
+
+import database
 
 
 class CollaborativeFilteringModel(nn.Module):

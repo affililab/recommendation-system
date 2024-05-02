@@ -125,12 +125,27 @@ def getUsersWithInteractions():
             users_with_interactions.append(user)
     return users_with_interactions
 
+def calculate_user_ratings(interactions_aggregated, max_interaction_weight=15):
+    # Normalisieren Sie die aggregierten Interaktionsgewichte auf eine Skala von 0 bis 5
+    for user_id, products in interactions_aggregated.items():
+        for product_id, weight in products.items():
+            normalized_weight = max(weight, 0)  # Verhindert negative Bewertungen
+            rating = (normalized_weight / max_interaction_weight) * 5
+            interactions_aggregated[str(user_id)][str(product_id)] = min(rating, 5)  # Stellt sicher, dass die Bewertung nicht über 5 steigt
+
+    return interactions_aggregated
+
+
 def get_user_product_interactions():
     client = pymongo.MongoClient(os.getenv('DB_MONGODB_CONNECTION'), connect=False)
     db = client[os.getenv('DB_MONGODB_DATABASE')]
     collection = db['users']
+    products = db['partnerprograms']
+    all_products = products.count()
 
     interactions = []
+    interactions_aggregated = {}
+    user_product_ratings = {}
     unique_user_ids = set()
     unique_product_ids = set()
 
@@ -142,9 +157,12 @@ def get_user_product_interactions():
         'removed_from_campaign': -2
     }
 
+    max_interaction_weight = 15
+
     for user in collection.find():
         user_id = user['_id']
         unique_user_ids.add(str(user_id))
+        interactions_aggregated[str(user_id)] = {}
         for interaction in user.get('partnerProgramInteractions', []):
             product_id = interaction['partnerProgram']
             unique_product_ids.add(str(product_id))
@@ -157,6 +175,23 @@ def get_user_product_interactions():
                 'interaction': weight
             })
 
+            if str(product_id) not in interactions_aggregated[str(user_id)]:
+                interactions_aggregated[str(user_id)][str(product_id)] = 0
+            interactions_aggregated[str(user_id)][str(product_id)] += weight
+
+    for user_id, products in interactions_aggregated.items():
+        if str(user_id) not in user_product_ratings:
+            user_product_ratings[str(user_id)] = {}
+        for product_id, weight in products.items():
+            if str(product_id) not in user_product_ratings[user_id]:
+                user_product_ratings[str(user_id)][str(product_id)] = 2.5
+            normalized_weight = max(weight, 0)  # Verhindert negative Bewertungen
+            rating = (normalized_weight / max_interaction_weight) * 5
+            user_product_ratings[str(user_id)][str(product_id)] = min(rating, 5)  # Stellt sicher, dass die Bewertung nicht über 5 steigt
+
     num_products = len(unique_product_ids)
-    num_users = len(unique_product_ids)
-    return interactions, unique_user_ids, unique_product_ids, num_users, num_products
+    num_users = len(unique_user_ids)
+
+    print(f'user_product_ratings: {user_product_ratings}')
+
+    return user_product_ratings, interactions, unique_user_ids, unique_product_ids, num_users, num_products, all_products

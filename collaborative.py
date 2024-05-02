@@ -1,11 +1,21 @@
 import os
+import time
 
+import psutil
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from bson import ObjectId
-
 import database
+import logging
+import torchmetrics
+from torchmetrics import MeanSquaredError
+from torchmetrics import MeanAbsoluteError
+
+logging.basicConfig(filename='logging.log', level=logging.INFO)
+auroc_metric = torchmetrics.AUROC(task="binary")
+mse_metric = MeanSquaredError(squared=False)
+mae_metric = MeanAbsoluteError()
 
 
 class CollaborativeFilteringModel(nn.Module):
@@ -33,18 +43,65 @@ def load_model(path='collaborative_model.pth'):
     model.load_state_dict(checkpoint['model_state_dict'])
     return model, checkpoint['num_users'], checkpoint['num_products']
 
-def train_collaborative_filtering_model(user_product_interactions, user_id_mapping, product_id_mapping):
+def calculate_precision(predicted_labels, ground_truth):
+    # Berechnung der Anzahl der korrekten Vorhersagen (sowohl vorhergesagt als auch tatsächlich positiv)
+    correct_predictions = (predicted_labels & ground_truth).sum().item()
+    # Berechnung der Gesamtanzahl der vom Modell als positiv vorhergesagten Interaktionen
+    total_predicted_positives = predicted_labels.sum().item()
+    # Vermeidung der Division durch Null
+    if total_predicted_positives == 0:
+        return 0
+    # Berechnung der Precision
+    precision = correct_predictions / total_predicted_positives
+    return precision
+
+def calculate_recall(predicted_positives, actual_positives):
+    # Berechnung der Anzahl der korrekten Vorhersagen (Schnittmenge von vorhergesagten und tatsächlichen positiven)
+    correct_predictions = (predicted_positives & actual_positives).sum().item()
+    # Berechnung der Gesamtanzahl der tatsächlichen positiven Interaktionen
+    total_actual_positives = actual_positives.int().sum().item()
+    # Vermeidung der Division durch Null
+    if total_actual_positives == 0:
+        return 0
+    # Berechnung des Recall
+    recall = correct_predictions / total_actual_positives
+    return recall
+
+
+def calculate_rae(predictions, actuals):
+    # Der Durchschnitt der tatsächlichen Werte
+    actuals_mean = actuals.mean()
+
+    # Summe der absoluten Fehler zwischen Vorhersagen und tatsächlichen Werten
+    sum_absolute_errors = torch.abs(predictions - actuals).sum()
+
+    # Summe der absoluten Fehler zwischen tatsächlichen Werten und ihrem Durchschnitt
+    sum_absolute_errors_baseline = torch.abs(actuals - actuals_mean).sum()
+
+    # Berechnung des RAE
+    rae = sum_absolute_errors / sum_absolute_errors_baseline if sum_absolute_errors_baseline != 0 else torch.tensor(
+        float('inf'))
+
+    return rae
+
+def train_collaborative_filtering_model(user_product_ratings, user_product_interactions, user_id_mapping, product_id_mapping, rating_threshold = 3):
     user_ids_tensor = torch.LongTensor(
         [user_id_mapping[str(interaction['user_id'])] for interaction in user_product_interactions])
     product_ids_tensor = torch.LongTensor(
         [product_id_mapping[str(interaction['product_id'])] for interaction in user_product_interactions])
     interactions_tensor = torch.FloatTensor([1 if interaction['interaction'] > 0 else 0 for interaction in user_product_interactions])
+    ratings_tensor = torch.FloatTensor([
+        user_product_ratings[str(interaction['user_id'])].get(str(interaction['product_id']), 2.5) # default is neutral rating
+        for interaction in user_product_interactions
+    ])
+
+
+    actual_positives = ratings_tensor > rating_threshold
+
 
     model = CollaborativeFilteringModel(num_users=len(user_id_mapping),
                                         num_products=len(product_id_mapping))
 
-    # Binary cross-entropy loss function and optimizer
-    criterion = nn.BCEWithLogitsLoss()
     # Apply weights based on interaction types
     weights_tensor = torch.FloatTensor(
         [interaction['interaction'] for interaction in user_product_interactions])
@@ -54,9 +111,15 @@ def train_collaborative_filtering_model(user_product_interactions, user_id_mappi
 
 
     # Training loop
-    num_epochs = 10
+    num_epochs = 50
+    start_time = time.time()
     for epoch in range(num_epochs):
         predictions = model(user_ids_tensor, product_ids_tensor)
+
+        predicted_positives = torch.sigmoid(predictions).squeeze() > 0.5
+
+        precision_score = calculate_precision(predicted_positives, actual_positives)
+        recall_score = calculate_recall(predicted_positives, actual_positives)
 
         optimizer = optim.Adam(model.parameters(), lr=0.001)
         optimizer.zero_grad()
@@ -67,7 +130,30 @@ def train_collaborative_filtering_model(user_product_interactions, user_id_mappi
         loss.backward()
         optimizer.step()
 
-        print(f'Epoch {epoch + 1}/{num_epochs}, Loss: {loss.item()}')
+        average_rating = torch.mean(ratings_tensor)
+
+        with torch.no_grad():
+            predicted_labels = torch.sigmoid(predictions).squeeze() > 0.5
+            correct_predictions = (predicted_labels == interactions_tensor).sum().item()
+            total_predictions = interactions_tensor.size(0)
+            accuracy = correct_predictions / total_predictions
+            sigmoid_predictions = torch.sigmoid(predictions)
+            auroc_score = auroc_metric(sigmoid_predictions, interactions_tensor.int())
+            mse_score = mse_metric(predictions.squeeze(), ratings_tensor)
+            mae_score = mae_metric(predictions.squeeze(), ratings_tensor)
+            rmse_score = torch.sqrt(mse_score)
+            rae_score = calculate_rae(predictions.squeeze(), ratings_tensor)
+
+        print(f'Epoch {epoch + 1}/{num_epochs}, Loss: {loss.item()}, accracy {accuracy}, precision: {precision_score}, recall: {recall_score}, correct_predictions: {correct_predictions}, total_predictions: {total_predictions}, roc_sensitivity: {auroc_score}, rmse_score: {rmse_score}, mae_score: {mae_score}, mse_score: {mse_score}, rae: {rae_score}')
+        # Loss und Accuracy loggen
+        logging.info(f'Epoch {epoch + 1}/{num_epochs}, Loss: {loss.item()}, Accuracy: {accuracy}, Precision: {precision_score}, recall: {recall_score}, RMSE: {rmse_score.item()}, MAE: {mae_score}, MSE: {mse_score}, RAE: {rae_score}, Precision: {precision_score}, AUROC: {auroc_score}')
+
+    end_time = time.time()  # Endzeit des Trainings
+    training_time = end_time - start_time  # Trainingszeit berechnen
+    memory_usage = psutil.Process(os.getpid()).memory_info().rss  # Speicherauslastung abrufen
+    logging.info(f'Retraining was required')
+    logging.info(f'Training time: {training_time} seconds')
+    logging.info(f'Memory usage: {memory_usage} bytes')
 
     return model
 
@@ -112,9 +198,29 @@ def handle_new_users(model, new_user_ids, user_id_mapping):
     ])
     return new_user_mapping
 
+def log_response_time(func):
+    def wrapper(*args, **kwargs):
+        start_time = time.time()
+        process = psutil.Process(os.getpid())
+        mem_before = process.memory_info().rss / (1024 * 1024)  # Konvertierung in Megabytes
+        result = func(*args, **kwargs)
+        end_time = time.time()
+        mem_after = process.memory_info().rss / (1024 * 1024)  # Konvertierung in Megabytes
+        model_size = get_model_size()
+        logging.info(f'{func.__name__} took {end_time - start_time} seconds to execute - by model size of Model size: {model_size} bytes, memory_usage: {mem_after - mem_before} MB')
+        return result
+    return wrapper
+
+def get_model_size(path='collaborative_model.pth'):
+    # Überprüft die Dateigröße in Bytes
+    size = os.path.getsize(path)
+    return size
+
+@log_response_time
 def get_recommendations_for_user(user_id):
     # get interactions
-    user_product_interactions, unique_user_ids, unique_product_ids, num_users, num_products = database.get_user_product_interactions()
+    user_product_ratings, user_product_interactions, unique_user_ids, unique_product_ids, num_users, num_products, all_products = database.get_user_product_interactions()
+    logging.info(f'Number of users: {num_users}, Number of all products: {all_products}, Number of interacted products: {num_products}')
 
     product_id_mapping = {product_id: i for i, product_id in enumerate(unique_product_ids)}
     user_id_mapping = {user_id: i for i, user_id in enumerate(unique_user_ids)}
@@ -125,7 +231,7 @@ def get_recommendations_for_user(user_id):
         model, num_users, num_products = load_model(path=model_path)
     else:
         # Train collaborative filtering model if the model doesn't exist
-        model = train_collaborative_filtering_model(user_product_interactions, user_id_mapping, product_id_mapping)
+        model = train_collaborative_filtering_model(user_product_ratings, user_product_interactions, user_id_mapping, product_id_mapping)
         num_users, num_products = len(user_id_mapping), len(product_id_mapping)
         # Save the trained model
         save_model(model, num_users=num_users, num_products=num_products, path=model_path)

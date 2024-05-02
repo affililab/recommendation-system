@@ -1,5 +1,6 @@
 from flask import Flask, request
 from flask_restful import Resource, Api
+import logging
 
 import collaborative
 import contentbased
@@ -9,6 +10,7 @@ api = Api(app)
 
 class RecommendationSystem(Resource):
     def post(self):
+        logging.basicConfig(filename='content_based.log', level=logging.INFO)
         data = request.get_json()
         print(data)
         recommends = contentbased.recommendation_wizzard(data)
@@ -17,6 +19,7 @@ class RecommendationSystem(Resource):
 
 class RecommendationSystemUserPreferences(Resource):
     def post(self):
+        logging.basicConfig(filename='content_based.log', level=logging.INFO)
         data = request.get_json()
         print(data['userId'])
         recommends = contentbased.recommendation_user(data['userId'])
@@ -24,12 +27,14 @@ class RecommendationSystemUserPreferences(Resource):
 
 class RecommendationSystemCategories(Resource):
     def post(self):
+        logging.basicConfig(filename='content_based.log', level=logging.INFO)
         data = request.get_json()
         recommends = contentbased.recommendation_categories(data['categories'])
         return recommends
 
 class CollaborativeFilteredRecommendation(Resource):
     def post(self):
+        logging.basicConfig(filename='logging.log', level=logging.INFO)
         data = request.get_json()
         recommends = collaborative.get_recommendations_for_user(data['userId'])
         return recommends
